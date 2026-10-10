@@ -55,3 +55,23 @@ nvcc -O3 -arch=native bench\cublas_sgemm.cu -o bench\cublas_sgemm.exe -lcublas
 
 > 注意：V51 的 2048^3 数字取自 `Operator/GEMM/note.md`，8192^3 取自
 > `V51.cu` 文件头。**两者需要在同一口径下重跑一遍**再写进简历。
+
+### 4.1 "83.28%" 的来历与修正
+
+`main.cu`（仓库根目录的历史 scratch 文件）记录了一次 cuBLAS 的单跑结果：
+
+| shape | cuBLAS 单跑 | 耗时 |
+| --- | ---: | ---: |
+| 2048^3 | 30.181 TFLOPS | 0.569 ms |
+| 8192^3 | 35.968 TFLOPS | 30.569 ms |
+
+`V51 @8192^3 = 29.9565 TFLOPS`，除以 35.968 正好得到 **83.28%** —— 这就是
+`Operator/GEMM/V51.cu` 文件头那句注释的出处。
+
+问题在于那次 cuBLAS 基线是**单次运行、没有 warm-up**。本仓库用 20 次
+warm-up + 100 次取 median 重测，8192^3 的 cuBLAS 是 **37.31 TFLOPS**
+（最好一次 29.261 ms，对应 37.58 TFLOPS）。热机后 cuBLAS 能吃到更高的
+boost 频率，所以真实比值是 **80.3%**，而非 83.28%。
+
+结论：**不要拿单次、无 warm-up 的对手成绩当分母**。3 个百分点看着不多，
+但面试官问"你怎么保证对比公平"时，这个口径答不出问题。

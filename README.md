@@ -36,7 +36,7 @@ Operator/
 | --- | ---: | --- | --- | --- |
 | Reduce | 9 | TODO | TODO | 剖析完成 |
 | GEMM | 13 | V51 | 24.03 TFLOPS @2048^3，8.71x vs base | 剖析完成 |
-| Softwaremax | 8 | TODO | TODO | 剖析完成 |
+| Softmax | 8 | TODO | TODO | 剖析完成 |
 | OnlineSoftmax | 5 | TODO | TODO | 剖析完成 |
 | LayerNorm | 4 | TODO | TODO | **待补 TODO** |
 | RMSNorm | 2 | TODO | TODO | **待补 TODO** |

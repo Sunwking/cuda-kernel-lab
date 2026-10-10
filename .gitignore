@@ -25,3 +25,12 @@ prof/build/
 !.vscode/settings.json
 .DS_Store
 Thumbs.db
+
+# --- local-only: personal notes and scratch files, not part of the public repo ---
+now.md
+plan.md
+plan.pdf
+work.md
+main.cu
+t_ascii.cu
+t_crlf.cu
