@@ -1,8 +1,9 @@
 // bench/cublas_sgemm.cu
-// Purpose: produce a reproducible cuBLAS SGEMM baseline you can quote on a resume.
+// Purpose: reproducible GEMM baselines for this machine -- FP32 SIMT, TF32 tensor
+//          core, and FP16-in/FP32-accumulate tensor core. These are the denominators
+//          every hand-written kernel in this repo is measured against.
 // Build:   nvcc -O3 -arch=native bench/cublas_sgemm.cu -o bench/cublas_sgemm.exe -lcublas
 // Run:     .\bench\cublas_sgemm.exe
-// Output:  per-shape mean/median/min TFLOPS under fp32 and tf32 math modes.
 
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <vector>
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cublas_v2.h>
 
 #define CK(x)                                                              \
@@ -32,34 +34,55 @@
         }                                                                  \
     } while (0)
 
-struct Stats {
-    double mean, median, min;
-};
+enum Mode { FP32, TF32, FP16 };
+
+static const char *mode_name(Mode m) {
+    return m == FP32 ? "fp32" : (m == TF32 ? "tf32" : "fp16");
+}
+
+struct Stats { double mean, median, min; };
 
 // C(M,N) = A(M,K) * B(K,N), all row-major.
 // cuBLAS is column-major, so we compute C^T = B^T * A^T via gemm(N, M, K).
-static Stats bench_shape(int M, int N, int K, int warmup, int iters,
-                         cublasMath_t math_mode, const char *tag) {
-    const size_t bytes_a = (size_t)M * K * sizeof(float);
-    const size_t bytes_b = (size_t)K * N * sizeof(float);
-    const size_t bytes_c = (size_t)M * N * sizeof(float);
+static Stats bench_shape(int M, int N, int K, int warmup, int iters, Mode mode) {
+    const size_t elems_a = (size_t)M * K, elems_b = (size_t)K * N, elems_c = (size_t)M * N;
+    const bool half_in = (mode == FP16);
 
-    std::vector<float> h_a((size_t)M * K, 1.0f), h_b((size_t)K * N, 1.0f);
-    float *a = nullptr, *b = nullptr, *c = nullptr;
-    CK(cudaMalloc(&a, bytes_a));
-    CK(cudaMalloc(&b, bytes_b));
-    CK(cudaMalloc(&c, bytes_c));
-    CK(cudaMemcpy(a, h_a.data(), bytes_a, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(b, h_b.data(), bytes_b, cudaMemcpyHostToDevice));
+    void *a = nullptr, *b = nullptr, *c = nullptr;
+    CK(cudaMalloc(&a, half_in ? elems_a * sizeof(__half) : elems_a * sizeof(float)));
+    CK(cudaMalloc(&b, half_in ? elems_b * sizeof(__half) : elems_b * sizeof(float)));
+    CK(cudaMalloc(&c, elems_c * sizeof(float)));   // accumulator always fp32
+
+    // All-ones inputs; A/B are exactly representable in every mode we test.
+    if (half_in) {
+        std::vector<__half> ha(elems_a), hb(elems_b);
+        for (auto &v : ha) v = __float2half(1.0f);
+        for (auto &v : hb) v = __float2half(1.0f);
+        CK(cudaMemcpy(a, ha.data(), elems_a * sizeof(__half), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(b, hb.data(), elems_b * sizeof(__half), cudaMemcpyHostToDevice));
+    } else {
+        std::vector<float> ha(elems_a, 1.0f), hb(elems_b, 1.0f);
+        CK(cudaMemcpy(a, ha.data(), elems_a * sizeof(float), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(b, hb.data(), elems_b * sizeof(float), cudaMemcpyHostToDevice));
+    }
 
     cublasHandle_t handle;
     CB(cublasCreate(&handle));
-    CB(cublasSetMathMode(handle, math_mode));
 
     const float alpha = 1.0f, beta = 0.0f;
     auto launch = [&]() {
-        CB(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-                       b, N, a, K, &beta, c, N));
+        if (half_in) {
+            CB(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+                            b, CUDA_R_16F, N, a, CUDA_R_16F, K, &beta,
+                            c, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT));
+        } else {
+            CB(cublasSetMathMode(handle, mode == TF32 ? CUBLAS_TF32_TENSOR_OP_MATH
+                                                      : CUBLAS_DEFAULT_MATH));
+            CB(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+                           (const float *)b, N, (const float *)a, K, &beta,
+                           (float *)c, N));
+        }
     };
 
     for (int i = 0; i < warmup; ++i) launch();
@@ -90,8 +113,8 @@ static Stats bench_shape(int M, int N, int K, int warmup, int iters,
     s.median = tflops(sorted[iters / 2]);
     s.min = tflops(sorted.front());
 
-    printf("  %-6s mean %6.2f  median %6.2f  min %6.2f TFLOPS   (best %7.3f ms)\n",
-           tag, s.mean, s.median, s.min, sorted.front());
+    printf("  %-6s mean %7.2f  median %7.2f  min %7.2f TFLOPS   (best %8.3f ms)\n",
+           mode_name(mode), s.mean, s.median, s.min, sorted.front());
 
     CB(cublasDestroy(handle));
     CK(cudaFree(a));
@@ -123,11 +146,14 @@ int main() {
     for (auto &sh : shapes) {
         const int M = sh[0], N = sh[1], K = sh[2];
         printf("M = N = K = %d\n", M);
-        Stats fp32 = bench_shape(M, N, K, warmup, iters, CUBLAS_DEFAULT_MATH, "fp32");
-        Stats tf32 = bench_shape(M, N, K, warmup, iters, CUBLAS_TF32_TENSOR_OP_MATH, "tf32");
-        printf("  fp32 vs SIMT peak : %5.1f%%\n", 100.0 * fp32.median / peak_fp32);
-        printf("  tf32/fp32 ratio   : %5.2fx  (<1.3 means cuBLAS fp32 is NOT using tensor cores)\n\n",
-               tf32.median / fp32.median);
+        Stats f32 = bench_shape(M, N, K, warmup, iters, FP32);
+        Stats tf  = bench_shape(M, N, K, warmup, iters, TF32);
+        Stats h   = bench_shape(M, N, K, warmup, iters, FP16);
+        printf("  fp32 vs SIMT peak : %6.1f%%\n", 100.0 * f32.median / peak_fp32);
+        printf("  tf32/fp32         : %6.2fx  (<1.3x means cuBLAS fp32 is NOT on tensor cores)\n",
+               tf.median / f32.median);
+        printf("  fp16/fp32         : %6.2fx  <-- tensor core headroom on this GPU\n", h.median / f32.median);
+        printf("  fp16 vs SIMT peak : %6.1f%%\n\n", 100.0 * h.median / peak_fp32);
     }
     return 0;
 }
