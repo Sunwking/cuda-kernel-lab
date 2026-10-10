@@ -1,0 +1,23 @@
+M = 4096
+N = 4096
+
+Computing CPU reference...
+CPU reference finished.
+==PROF== Connected to process 19940 (C:\Users\king\CUDA\Operator\OSoftmax\prof\build\V1.exe)
+block = 256
+==PROF== Profiling "online_softmax_v1": 0%....50%....100% - 41 passes
+grid = (4096)
+
+============================================
+                Result
+============================================
+Average Kernel Time = 0.190256 ms
+Performance = 440.913 GFLOPS
+AR = 0.625 FLOPs/Byte
+Check = PASS
+Row 0: first = 2.30626e-07, last = 0.000687487
+Expected first = 2.30626e-07, Expected last = 0.000687486
+
+Benchmark finished.
+==PROF== Disconnected from process 19940
+==PROF== Report: C:\Users\king\CUDA\Operator\OSoftmax\prof\V1.ncu-repz

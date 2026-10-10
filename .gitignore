@@ -1,0 +1,27 @@
+# --- build artifacts ---
+*.exe
+*.obj
+*.o
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+build/
+out/
+
+# --- python / torch extension caches ---
+__pycache__/
+*.pyc
+.torch_ext/
+
+# --- profiler binaries (keep the text exports) ---
+*.ncu-rep
+*.ncu-repz
+prof/build/
+
+# --- editor / os ---
+.vscode/*
+!.vscode/settings.json
+.DS_Store
+Thumbs.db

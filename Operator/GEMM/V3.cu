@@ -1,0 +1,430 @@
+/*
+M = 2048
+N = 2048
+K = 2048
+
+Computing CPU reference...
+CPU reference finished.
+block = 256
+grid = (16, 16)
+
+============================================
+                Result
+============================================
+Average Kernel Time = 1.9544 ms
+Performance = 8.79033 TFLOPS
+Arithmetic Intensity = 32 FLOPs/Byte
+Check = PASS
+
+C[0][0] = 2048
+Expected = 2048
+
+Benchmark finished.
+*/
+
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cstdlib>
+#include <cmath>
+
+using namespace std;
+
+// CUDA 错误检查宏
+#define CUDA_CHECK(call)                                      \
+do {                                                          \
+    cudaError_t err = call;                                   \
+    if (err != cudaSuccess) {                                 \
+        cerr << "CUDA Error: " << cudaGetErrorString(err) << endl;\
+        exit(EXIT_FAILURE);                                   \
+    }                                                         \
+} while (0)
+
+int M, N, K;
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 8;
+constexpr int TM = 8;
+constexpr int TN = 8;
+constexpr int BLOCK_SIZE = 256;
+
+// ============================================================
+// V3: Warp-level Tiling
+//
+// Block Tile = 128 × 128
+// Block Size = 256 threads = 8 warps
+//
+// Warp Tile = 32 × 64
+// Warp 内部线程布局 = 4 × 8
+//
+// 每个线程计算 = 8 × 8
+// ============================================================
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void sgemm_warp_tiling(float* A, float* B, float* C,
+                                   int M, int N, int K) {
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK][BN];
+
+    // 当前 Block 在 C 中的起始位置
+    int block_row = blockIdx.y * BM;
+    int block_col = blockIdx.x * BN;
+    int tid = threadIdx.x;
+
+    // Warp-level Tiling
+    // Warp 编号和 laneID
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+
+    // 一个 Block 分为 256 / 32 = 8 = 4 行 2 列个 Warp
+    // 所属 Warp 行列号
+    int warp_row = warp_id >> 1;
+    int warp_col = warp_id & 1;
+
+    // 一个 Warp 有 32 个线程排列为 4 * 8
+    int lane_row = lane_id >> 3;
+    int lane_col = lane_id & 7;
+
+    // 每个线程对应处理 TM * TN 块的左上角坐标
+    int thread_row = (warp_row * 4 + lane_row) * TM;
+    int thread_col = (warp_col * 8 + lane_col) * TN;
+
+    // 寄存器数组
+    float a_frag[TM], b_frag[TN];
+    float c_frag[TM][TN] = {0.0f};
+
+    // K 方向 Tile Loop
+    for(int bk = 0 ; bk < K ; bk += BK){
+        // Global Memory → Shared Memory
+
+        // 加载 A(BM, BK)
+        for(int i = tid ; i < BM * BK ; i += blockDim.x){
+            int row = i / BK, col = i % BK;
+            int g_row = block_row + row, g_col = col + bk;
+
+            As[row][col] = (g_row < M && g_col < K)? A[g_row * K + g_col] : 0.0f;
+        }
+
+        // 加载 B(BK, BN)
+        for(int i = tid ; i < BK * BN ; i += blockDim.x){
+            int row = i / BN, col = i % BN;
+            int g_row = bk + row, g_col = col + block_col;
+
+            Bs[row][col] = (g_row < K && g_col < N)? B[g_row * N + g_col] : 0.0f;
+        }
+
+        // 所有线程必须完成 Shared Memory 加载
+        __syncthreads();
+
+        //  Shared Memory → Register
+        //  Register → Register FMA
+        // 外积累加
+        
+        for(int k = 0 ; k < BK ; k ++ ){
+            // Shared Memory → Register
+            #pragma unroll
+            for(int i = 0 ; i < TM ; i ++ )
+                a_frag[i] = As[thread_row + i][k];
+
+            #pragma unroll
+            for(int j = 0 ; j < TN ; j ++ )
+                b_frag[j] = Bs[k][thread_col + j];
+
+            // 寄存器上做外积
+            for(int i = 0 ; i < TM ; i ++ )
+                for(int j = 0 ; j < TN ; j ++ )
+                    c_frag[i][j] += a_frag[i] * b_frag[j];
+        }
+
+        __syncthreads();
+    }
+    // 写回 Global Memory
+    for(int i = 0 ; i < TM ; i ++ )
+        for(int j = 0 ; j < TN ; j ++ ){
+            int r = block_row + thread_row + i;
+            int c = block_col + thread_col + j;
+            if(r < M && c < N)
+                C[r * N + c] = c_frag[i][j];
+        }
+}
+
+// ============================================================
+// CPU 版本，用于验证 CUDA 计算结果
+// ============================================================
+void sgemm_cpu(const float* A, const float* B, float* C, int M, int N, int K) { 
+    for (int row = 0; row < M; row++) { 
+        for (int col = 0; col < N; col++) { 
+            float sum = 0.0f; 
+            for (int k = 0; k < K; k++) 
+                sum += A[row * K + k] * B[k * N + col]; 
+            C[row * N + col] = sum; 
+        } 
+    } 
+}
+
+// ============================================================
+// 检查结果
+// ============================================================
+bool check_result(
+    const float* C, float* C_relif,  int M, int N){
+    const float tolerance = 1e-3f;
+
+    for (int i = 0; i < M * N; i++) {
+        float diff = fabs(C[i] - C_relif[i]);
+        if (diff > tolerance) {
+            cerr << "Mismatch at index " << i << ", GPU = " << C[i]
+                 << ", CPU = " << C_relif[i] << ", diff = " << diff << endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+int main(){
+    
+    M = N = K = 2 * 1024;
+
+    cout << "M = " << M << endl;
+    cout << "N = " << N << endl;
+    cout << "K = " << K << endl;
+
+    cout << endl;
+
+    // --------------------------------------------------------
+    // 2. 计算矩阵大小
+    // --------------------------------------------------------
+    size_t size_A = (size_t)M * K * sizeof(float);
+    size_t size_B = (size_t)K * N * sizeof(float);
+    size_t size_C = (size_t)M * N * sizeof(float);
+
+     // --------------------------------------------------------
+    // 3. 分配 Host 内存
+    // --------------------------------------------------------
+
+    float* h_A = (float*)malloc(size_A);
+    float* h_B = (float*)malloc(size_B);
+    float* h_C = (float*)malloc(size_C);
+    float* h_C_ref = (float*)malloc(size_C);
+
+    if (!h_A || !h_B || !h_C || !h_C_ref) {
+        cerr << "Host memory allocation failed!" << endl;
+        return EXIT_FAILURE;
+    }
+
+    // --------------------------------------------------------
+    // 4. 初始化数据
+    // --------------------------------------------------------
+
+    for (int i = 0; i < M * K; i++) {
+        h_A[i] = 1.0f;
+    }
+
+    for (int i = 0; i < K * N; i++) {
+        h_B[i] = 1.0f;
+    }
+
+    for(int i = 0 ; i < M * N ; i ++ )
+        h_C_ref[i] = 1.0f * K;
+
+    // --------------------------------------------------------
+    // 5. CPU 计算 Reference
+    // --------------------------------------------------------
+
+    cout << "Computing CPU reference..." << endl;
+
+    //sgemm_cpu(h_A, h_B, h_C_ref, M, N, K); 
+
+    cout << "CPU reference finished." << endl;
+
+    // --------------------------------------------------------
+    // 6. 分配 GPU 内存
+    // --------------------------------------------------------
+
+    float* d_A;
+    float* d_B;
+    float* d_C;
+
+    CUDA_CHECK(cudaMalloc(&d_A, size_A));
+    CUDA_CHECK(cudaMalloc(&d_B, size_B));
+    CUDA_CHECK(cudaMalloc(&d_C, size_C));
+
+    // --------------------------------------------------------
+    // 7. Host → Device
+    // --------------------------------------------------------
+
+    CUDA_CHECK(cudaMemcpy(d_A, h_A, size_A, cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice));
+
+    // --------------------------------------------------------
+    // 8. 设置 CUDA Kernel 配置
+    //
+    // 一个 Block = 256
+    //
+    // 每个 Thread 计算 C 的 Tm * Tn 个元素
+    // --------------------------------------------------------
+
+    dim3 block(BLOCK_SIZE);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    cout << "block = " << block.x << endl;
+    printf("grid = (%d, %d)\n", grid.x, grid.y);
+    // --------------------------------------------------------
+    // 9. Kernel 第一次运行
+    //
+    // 主要用于 warm-up
+    // 避免第一次 CUDA Kernel 启动带来的额外开销
+    // --------------------------------------------------------
+    sgemm_warp_tiling<BM, BN, BK, TM, TN>
+        <<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // --------------------------------------------------------
+    // 10. CUDA Event
+    // 用于准确测量 GPU Kernel 时间
+    // --------------------------------------------------------
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    // --------------------------------------------------------
+    // 11. Benchmark
+    // --------------------------------------------------------
+
+    const int iterations = 100;
+    CUDA_CHECK(cudaEventRecord(start));
+    for(int i = 0 ; i < iterations ; i ++ )
+        sgemm_warp_tiling<BM, BN, BK, TM, TN>
+        <<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+     // --------------------------------------------------------
+    // 12. 计算平均 Kernel 时间
+    // --------------------------------------------------------
+
+    float total_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+
+    float avg_ms = total_ms / iterations;
+
+     // --------------------------------------------------------
+    // 13. 计算 FLOPs
+    //
+    // GEMM:
+    //
+    // C = A × B
+    //
+    // 每一个 C 元素：
+    //
+    // K 次乘法
+    // K 次加法
+    //
+    // ≈ 2K FLOPs
+    //
+    // 一共 M × N 个元素
+    //
+    // 所以：
+    //
+    // FLOPs = 2 × M × N × K
+    // --------------------------------------------------------
+
+    double flops = 2.0 * (double)M * (double)N * (double)K;
+
+    // --------------------------------------------------------
+    // 14. 计算 TFLOPS
+    //
+    // avg_ms → 秒
+    // --------------------------------------------------------
+
+    double seconds = avg_ms / 1000.0;
+
+    double tflops = flops / seconds / 1e12;
+
+     // --------------------------------------------------------
+    // 15. Device → Host
+    // --------------------------------------------------------
+    CUDA_CHECK(cudaMemcpy(h_C, d_C, size_C, cudaMemcpyDeviceToHost));
+
+    // --------------------------------------------------------
+    // 16. 正确性检查
+    // --------------------------------------------------------
+
+    bool pass = check_result(h_C, h_C_ref, M, N);
+
+     // --------------------------------------------------------
+    // 17. 输出结果
+    // --------------------------------------------------------
+
+    cout << endl;
+    cout << "============================================" << endl;
+    cout << "                Result" << endl;
+    cout << "============================================" << endl;
+
+    cout << "Average Kernel Time = "
+         << avg_ms
+         << " ms" << endl;
+
+
+    cout << "Performance = "
+         << tflops
+         << " TFLOPS" << endl;
+
+    // 这里算的是单个 K-Step 上，一个 Block 的 Shared Memory 复用比：
+    // tile_flops = 2 * BM * BN * BK，tile_bytes = (BM + BN) * BK * 4
+    double tile_flops = 2.0 * (double)BM * (double)BN * (double)BK;
+    double memory_bytes = ((double)BM + (double)BN) * (double)BK * sizeof(float);
+    double arithmetic_intensity = tile_flops / memory_bytes;
+
+    cout << "Arithmetic Intensity = " << arithmetic_intensity << " FLOPs/Byte" << endl;
+    cout << "Check = "
+         << (pass ? "PASS" : "FAIL")
+         << endl;
+
+
+    // --------------------------------------------------------
+    // 18. 打印一个结果
+    // --------------------------------------------------------
+
+    cout << endl;
+
+    cout << "C[0][0] = " << h_C[0] << endl;
+
+    cout << "Expected = " << h_C_ref[0] << endl;
+
+    // --------------------------------------------------------
+    // 19. 清理 CUDA Event
+    // --------------------------------------------------------
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+
+    // --------------------------------------------------------
+    // 20. 释放 GPU 内存
+    // --------------------------------------------------------
+
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+
+
+    // --------------------------------------------------------
+    // 21. 释放 Host 内存
+    // --------------------------------------------------------
+
+    free(h_A);
+    free(h_B);
+    free(h_C);
+    free(h_C_ref);
+
+
+    cout << endl;
+    cout << "Benchmark finished." << endl;
+
+    return 0;
+}

@@ -1,0 +1,2 @@
+$p = Start-Process powershell -Verb RunAs -PassThru -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\Users\king\CUDA\Operator\LayerNorm\_ncu.ps1'
+Write-Host ('elevated exit code: ' + $p.ExitCode)

@@ -1,0 +1,19 @@
+﻿{
+    "files.associations":  {
+                               "*.cu":  "cuda-cpp",
+                               "*.cuh":  "cuda-cpp"
+                           },
+    "C_Cpp.default.cppStandard":  "c++17",
+    "C_Cpp.default.cStandard":  "c17",
+    "C_Cpp.default.intelliSenseMode":  "windows-msvc-x64",
+    "terminal.integrated.defaultProfile.windows":  "Command Prompt",
+    "files.exclude":  {
+                          "**/*.obj":  true,
+                          "**/*.ilk":  true,
+                          "**/*.pdb":  true,
+                          "**/*.exp":  true,
+                          "**/*.iobj":  true,
+                          "**/*.ipdb":  true
+                      },
+    "python.defaultInterpreterPath":  "C:\\Users\\king\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
+}
