@@ -47,7 +47,7 @@ Expected = 8192
 
 Benchmark finished.
 
-到达 cuBLAS 的 83.3% 性能, 但 cuBLAS 是用 2 个 SM 做的, 而我们是 1 个 SM 做的, 所以性能差距不大。
+80.3% of cuBLAS fp32 (same SIMT path, verified via tf32/fp32 = 1.35x)
 */
 
 #include <iostream>
