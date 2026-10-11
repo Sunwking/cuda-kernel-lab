@@ -10,8 +10,8 @@
 | --- | --- | --- |
 | 0 | 测 cuBLAS fp16 锚点 | ✅ 完成，见下 |
 | 1 | **单 warp 最小 mma，把 fragment layout 钉死** | ✅ 完成（`V0.cu`，`max error = 0`） |
-| 2 | `ldmatrix` 从 shared memory 装 fragment（先不做 swizzle） | ⬜ 下一步 |
-| 3 | 接进 tiling 框架（block 128x128 / warp 64x64 / K 分块 16） | ⬜ |
+| 2 | `ldmatrix` 从 shared memory 装 fragment（先不做 swizzle） | ✅ 完成（`V1.cu`，`max error = 0`） |
+| 3 | 接进 tiling 框架（block 128x128 / warp 64x64 / K 分块 16） | ⬜ 下一步 |
 | 4 | swizzle 消 bank conflict + 调 tile 尺寸 | ⬜ |
 | 5 | `cp.async` 多级流水线（2 → 4 stage）+ 寄存器双缓冲 | ⬜ |
 | 6 | 非对齐 shape 边界 + split-K，对比 cuBLAS fp16 | ⬜ |
@@ -73,17 +73,57 @@ C[(group+8)*8 + 2*tid + 1] = c[3];
 选整数是为了：错了你能一眼看出是转置、错位还是只算了半个 tile。随机数只能告诉你"错了"。
 Step 2 起继续复用这份数据和 CPU 参考，把 `V0` 当 oracle 对拍。
 
-## Step 2 任务（`V1.cu`）：用 `ldmatrix` 从 shared memory 装 fragment
+## Step 2 结论（`V1.cu`）：`ldmatrix` 装 fragment
 
-现在 fragment 是每个线程自己 `A[...]` 一条条从 global 捞的——能跑，但完全没法用。
-真实 kernel 里 A/B 先落到 shared memory，再由 `ldmatrix.sync.aligned.m8n8.x4` 一句装好。
+`V1.cu` 打通了 global → shared → `ldmatrix` → `mma`，数值与 `V0` 逐位一致。
+硬证据（`-Xptxas -v` + `cuobjdump -sass`）：
 
-**只做一件事**：把 global → shared → `ldmatrix` → `mma` 这条路打通，数值仍与 `V0` 完全一致。
+```
+LDSM.16.M88.4  R4, [R0+UR4]   ; x4 非转置 -> A
+LDSM.16.MT88.2 R8, [R8+UR6]   ; x2 转置   -> B   (MT = Matrix Transposed)
+HMMA.16816.F32 R4, R4, R8, RZ
+14 registers, 768 bytes smem = 16*16*2(A) + 16*8*2(B)
+```
 
-- `ldmatrix.m8n8.x4` 需要 shared memory 地址（`__cvta_generic_to_shared()` 转出来的 32 位地址），
-  每个 lane 给一个"8x8 子块的行首地址"，硬件把 4 个 8x8 子块按你这套 layout 摊到寄存器上。
-- **先不做 swizzle**，接受 bank conflict，先把数值跑对；swizzle 留到 Step 4。
-- 验收：`Check: PASS`，并且能说出"一条 `ldmatrix.x4` 搬了多少字节、为什么它天然产出上面那套 layout"。
+地址规则（本步唯一要学的东西）：
+
+| lane | 给的地址 | 对应子块 |
+| --- | --- | --- |
+| 0-7 | `&As[0..7][0]` | A 左上（a[0]） |
+| 8-15 | `&As[8..15][0]` | A 左下（a[1]） |
+| 16-23 | `&As[0..7][8]` | A 右上（a[2]） |
+| 24-31 | `&As[8..15][8]` | A 右下（a[3]） |
+| 0-15（`.x2`） | `&Bs[0..15][0]` | B 的上/下半（b[0]/b[1]），`.trans` |
+
+归纳式：`a_row = ((lane>>3)&1)*8 + (lane&7)`，`a_col = (lane>>4)*8`，`b_row = lane & 15`。
+
+**为什么 B 必须 `.trans`**：`b[0] = {B[2*tid][group], B[2*tid+1][group]}` 的两个元素在 B 内存里
+隔了整整一行；非 `.trans` 的 `ldmatrix` 只会给"同一行里连续两个"，物理上装不出来。换成非 `.trans`
+实测 `mismatched = 128 / 128`。
+
+**寄存器级对拍**（比 `PASS` 强，用来把 `mma` 从嫌疑里摘掉）：lane 0 的期望值
+`a = 3c000000 58085800 48804800 58485840`、`b = 48000000 54805400`，
+逐位相同即说明 `ldmatrix` 的装填完全正确。
+
+**踩过的坑**
+
+- `__align__(16)` 不可省，否则行首不对齐是 UB，结果是随机错。
+- `.x2` 只用 lane 0-15 的地址；lane 16-31 也必须给出**合法**地址（用 `lane & 15` 重复一遍），
+  不能写成 `&Bs[lane*8]`（那是越界指针）。
+- `ldmatrix` 吃的是 32 位 shared 地址，必须过 `__cvta_generic_to_shared()`。
+
+## Step 3 任务（`V2.cu`）：接进 tiling 框架
+
+前面两版都只有 1 个 warp、1 个 tile，纯玩具。Step 3 开始才是真正的 GEMM：
+
+- block tile **128x128**，warp tile **64x64**（即 block 内 2x2 个 warp），K 方向按 16 分块。
+- 每个 warp 算 64x64 的输出，折算成 `m16n8k16` 就是 **4x8 = 32 条 mma**（4 个 M 方向 x 8 个 N 方向）。
+- shared memory 放 A tile(128xK) 和 B tile(Kx128)，`ldmatrix` 按 warp 坐标切出自己那份。
+- **先不做 swizzle**，接受 bank conflict；先把数值跑对，再做性能。
+- 正确性 oracle：同一份随机数据下与 `bench/cublas_sgemm.exe` 的 fp16 结果比对
+  （相对误差 ~1e-2 量级即可，fp16 累加顺序不同必然有小差异）。
+
+**验收**：2048^3 fp16 跑通且数值正确，先别管性能；性能调优是 Step 4/5 的事。
 
 ## 三个必踩的坑
 
@@ -96,8 +136,11 @@ Step 2 起继续复用这份数据和 CPU 参考，把 `V0` 当 oracle 对拍。
 ## 工程注意（这台机器）
 
 - `nvcc -arch=native`：本机是 sm_120，直接编到原生架构，别写死 `-arch=sm_80`。
-- **`.cu` 带中文注释时必须存成 UTF-8 with BOM**。中文 Windows 下 MSVC 默认按 GBK 读无 BOM 的
-  UTF-8 源码，个别汉字的字节序列会吃掉换行，报出莫名其妙的"行号错位 + 标识符 undefined"。
+- **`.cu` 带中文注释时，必须让 MSVC 按 UTF-8 读源码**。中文 Windows 下 MSVC 默认按 GBK 读无 BOM
+  的 UTF-8 源码，个别汉字的字节序列会吃掉换行，报出莫名其妙的"行号错位 + 标识符 undefined"。
+  两个解法（任选，建议都用）：
+  1. 存成 **UTF-8 with BOM**；
+  2. 编译时加 `-Xcompiler "/utf-8"`：`nvcc -O3 -arch=native -Xcompiler "/utf-8" V1.cu -o V1.exe`。
   表现：错误行号和真实文件对不上 → 先怀疑编码，不是代码。
 
 ## 资料

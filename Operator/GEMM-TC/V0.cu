@@ -50,6 +50,9 @@ __global__ void mma_probe(const __half* __restrict__ A,
     b[0] = pack2(B[(tid*2 + 0) * 8 + group], B[(tid*2 + 1) * 8 + group]);
     b[1] = pack2(B[(tid*2 + 8) * 8 + group], B[(tid*2 + 9) * 8 + group]);
 
+    if (threadIdx.x == 0) {
+       printf("a: %08x %08x %08x %08x | b: %08x %08x\n", a[0],a[1],a[2],a[3],b[0],b[1]);
+    }
     // D = A*B + C，操作数顺序是 {d}, {a}, {b}, {c}。
     float c[4] = {0.f, 0.f, 0.f, 0.f};
     asm volatile(
