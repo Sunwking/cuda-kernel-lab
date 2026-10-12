@@ -1,7 +1,7 @@
 # GEMM-TC — Tensor Core GEMM 学习阶梯
 
 > 目标：把 `Operator/GEMM/` 里那套 CUDA Core 的 SIMT GEMM（24.03 TFLOPS @2048^3）
-> 换成 Tensor Core 版本，达到 **≥80 TFLOPS**（cuBLAS fp16 的 80%）。
+> 换成 Tensor Core 版本，达到 **≥80 TFLOPS**（= cuBLAS fp16 91.98 的 87%）。
 > 参考基线见 `bench/README.md`。
 
 ## 进度
@@ -11,10 +11,11 @@
 | 0 | 测 cuBLAS fp16 锚点 | ✅ 完成，见下 |
 | 1 | **单 warp 最小 mma，把 fragment layout 钉死** | ✅ 完成（`V0.cu`，`max error = 0`） |
 | 2 | `ldmatrix` 从 shared memory 装 fragment（先不做 swizzle） | ✅ 完成（`V1.cu`，`max error = 0`） |
-| 3 | 接进 tiling 框架（block 128x128 / warp 64x64 / K 分块 16） | ⬜ 下一步 |
-| 4 | swizzle 消 bank conflict + 调 tile 尺寸 | ⬜ |
-| 5 | `cp.async` 多级流水线（2 → 4 stage）+ 寄存器双缓冲 | ⬜ |
-| 6 | 非对齐 shape 边界 + split-K，对比 cuBLAS fp16 | ⬜ |
+| 3 | 接进 tiling 框架（block 128x128 / warp 64x32 / K 分块 16） | ✅ 完成（`V2.cu`，46.19 TFLOPS @2048^3） |
+| 4 | swizzle 消 bank conflict + 调 tile 尺寸 | ✅ 完成（`V3.cu` / `V4.cu`，59.2 TFLOPS） |
+| 5 | `cp.async` 多级流水线（shared memory 层面） | ✅ 完成（`V5.cu`，77.5 TFLOPS） |
+| 5b | 寄存器双缓冲（fragment 预取） | ✅ 完成（`V5b.cu`，78.0 TFLOPS） |
+| 6 | 任意 shape 边界 + split-K | ✅ 完成（`V6.cu`，瘦长 shape 上 split-K 提速 13.4×） |
 
 ## Step 0 结果：这台机器的 Tensor Core 上限
 
@@ -112,18 +113,324 @@ HMMA.16816.F32 R4, R4, R8, RZ
   不能写成 `&Bs[lane*8]`（那是越界指针）。
 - `ldmatrix` 吃的是 32 位 shared 地址，必须过 `__cvta_generic_to_shared()`。
 
-## Step 3 任务（`V2.cu`）：接进 tiling 框架
+## Step 3 结论（`V2.cu`）：tiling 框架
 
-前面两版都只有 1 个 warp、1 个 tile，纯玩具。Step 3 开始才是真正的 GEMM：
+grid = `(N/BN, M/BM)`，每个 block 算 C 的 128x128 小块；block = 8 个 warp (256 线程)，
+排成 2(行) x 4(列)，每个 warp 算 64x32；K 方向在 block 内部循环，每轮吃 16 个 k。
 
-- block tile **128x128**，warp tile **64x64**（即 block 内 2x2 个 warp），K 方向按 16 分块。
-- 每个 warp 算 64x64 的输出，折算成 `m16n8k16` 就是 **4x8 = 32 条 mma**（4 个 M 方向 x 8 个 N 方向）。
-- shared memory 放 A tile(128xK) 和 B tile(Kx128)，`ldmatrix` 按 warp 坐标切出自己那份。
-- **先不做 swizzle**，接受 bank conflict；先把数值跑对，再做性能。
-- 正确性 oracle：同一份随机数据下与 `bench/cublas_sgemm.exe` 的 fp16 结果比对
-  （相对误差 ~1e-2 量级即可，fp16 累加顺序不同必然有小差异）。
+一个 warp 每轮发 `MF x NF = 4 x 4 = 16` 条 mma（64/16=4 个 M fragment，32/8=4 个 N fragment），
+累加器 64 个 float + fragment 24 个 uint32 → **94 registers, 0 spills, 8192 B smem**
+（8192 = `128*16*2 + 16*128*2`）。
 
-**验收**：2048^3 fp16 跑通且数值正确，先别管性能；性能调优是 Step 4/5 的事。
+实测：
+
+```
+[check] 256x256x256  max|abs diff| = 1.34e-05   mismatched = 0 / 65536   -> PASS
+[check] 512x512x512  max|abs diff| = 3.05e-05   mismatched = 0 / 262144  -> PASS
+[bench] 2048x2048x2048  median 0.372 ms  ->  46.19 TFLOPS
+LDSM.16.M88.4 x4   LDSM.16.MT88.2 x4   HMMA x16   LDG x8   STS x8   （每个 K 迭代）
+```
+
+`LDG 8` = `BM*BK/NTHREADS = 2048/256`，`STS 8` = `BK*BN/NTHREADS`；
+`HMMA 16` = `MF*NF`。这三个数能反推"结构写对了没"。
+
+对照：SIMT 版 24.03，cuBLAS fp16 91.98。**只把 tiling 搭对就 1.9x**。
+
+### 这一脚踩过的坑：`ldmatrix` 的地址规则 != fragment 的归属规则
+
+写回 C 时最容易顺手把 `ldmatrix` 那套 lane 规则抄过来（`((lane>>3)&1)*8 + (lane&7)`），
+那是错的。两套规则分工不同：
+
+| 规则 | 回答的问题 | 形式 |
+| --- | --- | --- |
+| 地址规则 | 你这个 lane 负责**搬**哪一行的 16 字节 | 8 行一组：lane 0-7 给子块0… |
+| 寄存器归属规则 | 搬完之后**谁手里拿着哪个元素** | `row = lane>>2`、`col = 2*(lane&3)` |
+
+C 的 fragment 归属和 A 的寄存器归属是同一套（V0 验过），与地址规则无关。
+写错的后果不是"稍微偏一点"，而是 lanes 0-3 会往同一格写不同值、大量位置没人写、
+并且 `grow+8` 会越过 C 的行边界 → 越界写。
+
+自检法子：一个 16x8 fragment 有 32 lane x 4 累加器 = 128 个值，必须**每格恰好写一次**。
+代 `lane=0..3` 进去，应落在 (0,0)、(0,2)、(0,4)、(0,6)。
+
+**已知限制（Step 6 再解决）**：M/N/K 必须能被 128/128/16 整除，没有边界判断。
+
+**留给 Step 4/5 的两块**：
+
+- shared memory 没做 swizzle，`ldmatrix` 有 bank conflict。
+  粗算：A 的 tile 行距 `BK*2 = 32B` → 0,8,16,24,0,8,16,24… 号 bank → 2 路冲突；
+  B 的行距 `BN*2 = 256B` → 每行都从 bank 0 开始 → **8 路冲突**，B 那边更惨。
+- 没有 `cp.async`，每轮 K 都要 `__syncthreads()` 停下来等 global load。
+
+## Step 4 任务（`V3.cu` / `V4.cu`）：消 bank conflict
+
+本步算法一行不改，只改 shared memory 的**摆放方式**。两个文件各教一条路：
+
+- `V3.cu`：**padding**。给行距加 8 个 half，让 8 个 lane 的 16B 窗口正好铺满 32 个 bank。
+  4 个空：`AST`、`BST`，以及两处 ldmatrix 地址里的行距。
+- `V4.cu`：**XOR swizzle**（CUTLASS 走的路）。不浪费存储，把"16B 块号"和"行号低 3 位"异或。
+  2 个空：搬入用的 `swz_b(k,col)` 和 ldmatrix 用的 `swz_b_chunk(k,col)`。
+
+### 先把账算清楚
+
+shared = 32 bank x 4B，一次 ldmatrix 里 8 个 lane 各读 16B（= 4 个 bank），
+所以目标是**这 8 个窗口互不重叠**。行 r 的 bank = `(r * 行距字节数 / 4) mod 32`。
+
+| tile | 原行距 | 每行错开几个 bank | 结果 |
+| --- | --- | --- | --- |
+| A (BK=16) | 32B | 8 | 行 0..7 落 0,8,16,24,0,8,16,24 → **2 路冲突** |
+| B (BN=128) | 256B | 64 mod 32 = 0 | 8 行全从 bank 0 开始 → **8 路冲突** |
+| A (BK=64) | 128B | 32 mod 32 = 0 | 8 行全从 bank 0 开始 → **8 路冲突** |
+
+所以 padding 的目标是让"每行错开 4 个 bank"（16B 窗口依次落在 [0-3],[4-7],…,[28-31]）。
+
+### 为什么 A 用 padding、B 用 swizzle
+
+swizzle 靠"行号混进列位置"来错开，**一行里的 16B chunk 数必须够多**：
+
+- A tile 一行 `BK=16` 个 half = 32B = **2 个** chunk → 只能错开 2 种位置，不够 → 只能 padding。
+- B tile 一行 `BN=128` 个 half = 256B = **16 个** chunk → 足够 → 可以 swizzle。
+
+这也是真实 kernel 里 `BK` 通常取 64 及以上的原因之一：tile 够宽，swizzle 才玩得转。
+
+### 实验对照表（先自己预测，再编译验证）
+
+改顶部一个 `BK` 常量就能切换配置。**第 3 行是关键**：先写下你的预测再看。
+
+| # | K 块 | A | B | TFLOPS |
+| --- | --- | --- | --- | --- |
+| 0 | 16 | 行距 16 | 行距 128 | 46.19（= V2 基线） |
+| 1 | 16 | padding | padding | 50.3 |
+| 2 | 64 | padding | padding | 58.5 |
+| 3 | 64 | **无 padding** | **无 padding** | **39.4** |
+| 4 | 16 | padding | swizzle | 50.3|
+| 4 | 64 | padding | swizzle | 59.5 |
+| 5 | 16 | **无 padding** | padding | 51.24 |
+
+### 实测结论
+
+`V3.cu`（BK=64, padding）**58.52 TFLOPS** / 108 regs / 35840 B smem；
+`V4.cu`（BK=64, A padding + B swizzle）**59.24 TFLOPS** / 112 regs / 34816 B smem。
+两者差距在噪声内 —— **swizzle 的收益是省下约 1 KB shared，不是更快**；它真正的价值是
+"tile 做得更宽（BK>=64）时还能保持零冲突"，以及面试必问。
+
+第 5 行（BK=16，只给 B padding、A 不管）**51.24**，比全 padding 的 50.3 还快一点点：
+说明 BK=16 下 A 的 2 路冲突基本不要钱（**2 路 ≈ 免费，8 路才是灾难**），
+真正要治的是 B。做优化要能分辨"哪一处冲突值钱"。
+
+**验收**：两个文件都 `PASS`，`[bench]` 落在对照行 ±3% 内，并能解释第 3 行。
+
+**这一步的判断（后面被 Step 5 验证了）**：BK=16 下把冲突全消掉只涨约 8%，
+说明 bank conflict **不是**当时的主瓶颈 —— 主瓶颈是缺少流水线。
+
+## Step 5 任务（`V5.cu`）：`cp.async` 多级流水线
+
+前面每一步优化的都是 shared memory 的**布局**，这一步第一次优化**时序**：
+把"搬 tile 时 Tensor Core 干等着"的时间消掉。
+
+三个填空，都在流水线的"大脑"位置（不是抄索引，是要想清楚在飞几级）：
+
+1. 序言要预取几级 buffer。
+2. 主循环里 `cp_wait<???>()` 该等到剩几组。
+3. 预取要写回哪一级 buffer。
+
+参考解实测（2048^3，全部 PASS）：
+
+| BK | stages | smem | TFLOPS |
+| --- | --- | --- | --- |
+| 16 | 2 | 21.0 KB | 68.5 |
+| 16 | **3** | 31.5 KB | **77.5** |
+| 16 | 4 | 42.0 KB | 77.0 |
+| 16 | 5 | 52.5 KB | 68.0 |
+| 16 | 6 | 63.0 KB | 66.9 |
+| 32 | 3 | 55.5 KB | 68.4 |
+| 32 | 4 | 74.0 KB | 68.3 |
+| 64 | 2 | 70.0 KB | 61.0 |
+| 64 | 3 | 105 KB | launch 失败（超 shared 上限） |
+
+**级数不是越多越好**：shared 变大 → 每个 SM 能驻留的 block 变少 → 并行度下降，
+把流水线省下的时间又赔回去。3 级刚好。
+
+### 为什么 S=5 掉下悬崖：occupancy 账
+
+本机（RTX 5070 Ti / sm_120）的硬约束（用 `devquery.cu` 实测）：
+
+| 资源 | 值 |
+| --- | --- |
+| regs / SM | 65536 |
+| shared / SM | 100 KB |
+| shared / block（opt-in 上限） | 99 KB |
+| threads / SM | 1536 |
+| blocks / SM | 24 |
+
+每 block 256 线程、实测 **104~106 registers**：
+
+- 寄存器限制：`65536 / (104 * 256) = 2.46` → **最多 2 个 block/SM**（与级数无关）
+- 线程限制：`1536 / 256 = 6` → 不是瓶颈
+- shared 限制（100 KB/SM）：
+
+| stages | smem/block | shared 能放几个 | 实际驻留 | TFLOPS |
+| --- | --- | --- | --- | --- |
+| 2 | 21.0 KB | 4 | 2（寄存器卡住） | 68.5 |
+| 3 | 31.5 KB | 3 | 2 | **77.5** |
+| 4 | 42.0 KB | 2 | 2 | 77.0 |
+| 5 | 52.5 KB | **1** | **1** ← 掉崖 | 68.0 |
+| 6 | 63.0 KB | **1** | 1 | 66.9 |
+
+平台期是 S=3/4（都是 2 block/SM + 流水足够深）；S=5 掉到 1 block/SM，并行度减半，
+流水线省下的时间全赔回去。注意 S=2 也是 2 block/SM 却只有 68.5 —— 那是**流水太浅**
+（在飞的只有 1 级，藏不住内存延迟），两种瓶颈要分开看。
+
+另外 `BK=64 / stages=3` 需要 105 KB/block，**超过 99 KB 的 opt-in 上限**，
+`cudaFuncSetAttribute` 直接返回 `invalid argument` —— 那一格是启动失败，不是变慢。
+
+**里程碑**：`BK=16 / stages=3` 的 77.5 TFLOPS = SIMT 版（24.03）的 **3.2 倍**，
+达到 cuBLAS fp16（91.98）的 **84%**。77.5 还**没**摸到 `≥80 TFLOPS` 这条线（差 3%）——真正越过去的是 4096³：Step 6 的 91.6（cuBLAS 的 94%）。
+
+## Step 5b 任务（`V5b.cu`）：寄存器双缓冲
+
+V5 把 global → shared 的搬运藏起来了，但 shared → 寄存器的 `LDSM` 没藏：
+
+```
+cp_wait → __syncthreads → LDSM(第 i 级) → HMMA(第 i 级) → issue → commit
+```
+
+屏障之后所有 warp 一起冲出来做 LDSM，而 HMMA 必须等 LDSM 的结果。修法是把 LDSM 提前一级：
+
+```
+V5 :  LDSM(i)   → HMMA(i)   → LDSM(i+1) → HMMA(i+1)    每个 LDSM 都挡在 HMMA 前面
+V5b:  LDSM(i+1) → HMMA(i)   → LDSM(i+2) → HMMA(i+1)    HMMA 一发出去，LDSM 就在后台跑
+```
+
+三个填空：序言的 `cp_wait` 参数、主循环 `cp_wait` 的参数、预取的目标 buffer 下标。
+**本步真正要"想"的不是这三个数，而是 `issue/commit` 的位置变了**：它被挪到 `cp_wait`
+**之前**，commit 组的编号整体前移一位，于是同一个 `cp_wait<NSTAGE-2>` 的含义从
+"保证第 i 级就绪"变成"保证第 i+1 级就绪"。照抄 V5 的顺序去预取下一级，读到的是没搬完的 buffer。
+
+参考解实测（2048³，median of 50）：
+
+| 配置 | 寄存器（V5 / MINB=2 / MINB=1） | 驻留 | V5（无） | V5b `MINB=2` | V5b `MINB=1` |
+| --- | --- | --- | --- | --- | --- |
+| BK=16 / stages=3 | 104 / 128 / 151 | 2 / 2 / 1 | 77.2 | **78.0** | 70.9 |
+| BK=16 / stages=4 | 106 / 127 / 152 | 2 / 2 / 1 | 76.7 | 77.7 | 66.8 |
+| BK=16 / stages=5 | 106 / 128 / 150 | 1 / 1 / 1 | 68.1 | 68.4 | **70.3** |
+
+参考解实测（4096³，median of 50）：
+
+| 配置 | 寄存器（V5 / MINB=2 / MINB=1） | 驻留 | V5（无） | V5b `MINB=2` | V5b `MINB=1` |
+| --- | --- | --- | --- | --- | --- |
+| BK=16 / stages=3 | 104 / 128 / 151 | 2 / 2 / 1 | 88.8 | **91.0** | 80.0 |
+| BK=16 / stages=4 | 106 / 127 / 152 | 2 / 2 / 1 | 88.3 | 91.0 | 76.9 |
+| BK=16 / stages=5 | 106 / 128 / 150 | 1 / 1 / 1 | 78.2 | 78.8 | 81.0 |
+
+（`MINB` = `__launch_bounds__` 的第二个参数，也就是"我承诺每个 SM 至少驻留几个 block"。）
+
+**收益比预期小得多，这是本步最值得记住的一条。**
+2 block/SM = 16 个 warp/SM 的时候，LDSM 的延迟**早就**被别的 warp 盖住了，寄存器双缓冲
+几乎没有空间：77.2 → 78.0，+0.9%。只有 occupancy 掉到 1 block/SM（stages=5）时，warp 级
+并行藏不住延迟，指令级并行才有价值 —— 但**前提是同时放开寄存器**：`MINB=1` 时 ptxas 用
+150 个寄存器，68.1 → 70.3（+3.3%）；`MINB=2` 时它被钉在 128 个，只剩 +0.5%。
+
+**`__launch_bounds__` 的第二参数是"承诺"不是"愿望"。** stages=5 时 smem 已经只能放 1 个
+block，你还在承诺 2 个，于是白白丢掉 22 个寄存器、什么都没换到。反过来在 stages=3/4 上写
+`MINB=1` 就是灾难：151 个寄存器直接把 occupancy 打到 1 block/SM，77.2 → 70.9。
+
+**代价**：fragment 要两套寄存器，`a[MF][4] + b[NF][2] = 24` 个翻倍，104 → 128（钉住之后，
+ptxas 是 0 spill）。
+
+### 2048³ 为什么只有 78：尾波
+
+同一份 `V5b`（BK=16 / stages=3）：
+
+| shape | TFLOPS | 对比 cuBLAS fp16 |
+| --- | --- | --- |
+| 2048³ | 78.0 | 91.98 → 85% |
+| 4096³ | 89.9 | 97.33 → 92% |
+
+2048³ 的 grid 只有 256 个 block，而（2 block/SM × 70 SM）= 140 个槽位，
+`256 / 140 = 1.83` 波 —— 第二波只装了 83% 就结束了。用 `256 / (2×140) = 91.4%`
+修正尾波，`78.0 / 0.914 = 85.3`；拿 4096³ 的 89.9 当渐近值，能对上 95%。
+**所以 2048³ 这个数不是 kernel 不行，是 shape 太小喂不饱机器。**
+
+## Step 6 任务（`V6.cu`）：任意 shape 的边界 + split-K
+
+前 5(b) 步都假设 M/N 是 128 的倍数、K 是 16 的倍数。这一步把假设拆掉，并加上 split-K。
+
+**边界**：越界的位置补 0（zfill）。补完之后每个 tile 都是满的，`mma` 那部分一行都不用改。
+
+补零的第二个坑在**搬运**上 —— `cp.async` 要求 global 地址 **16 字节对齐**：
+`A[grow][gk]` 的字节地址是 `(grow*K + gk) * 2`，K 不是 8 的倍数时（比如 K=131）行首
+只有 2 字节对齐，`cp.async` 直接报 `misaligned address`。所以搬运必须留一条逐元素拷贝的退路。
+**split-K**：`grid.z = SPLITK`，把 K 方向切成 SPLITK 段，每段算一份部分和，最后用 `atomicAdd` 累加。
+
+参考解实测（2048³，median of 50）：
+
+| 配置 | 寄存器 | 驻留 | TFLOPS |
+| --- | --- | --- | --- |
+| 未加边界（= V5b） | 128 | 2 | 78.0 |
+| 加边界，**不加** `__launch_bounds__` | 141 | **1** | 62.6 |
+| 加边界 + `MINB=2` | 128 | 2 | **78.2** |
+
+边界判断本身几乎不要钱（78.0 → 78.2），但会让 ptxas 多用 13 个寄存器。不管它就直接掉到
+1 block/SM、掉 20% —— 又是 Step 5b 那条「寄存器决定 occupancy」的复读。
+
+**验收口径**：`-Xptxas -v` 报 `128 registers`；四条边界 shape（`129x130x131` / `257x385x1000` /
+`128x128x2048` / `512x512x2048`）全 PASS；`compute-sanitizer --tool memcheck` 在 `SPLITK=1` 和
+`SPLITK=4` 两种编译下都报 `0 errors`。性能（均 splitK=1）：`2048³ = 78.2` / `4096³ = 91.6` /
+`256x256x32768 = 4.23`。`4096³` 的 91.6 是 cuBLAS fp16（97.33）的 **94%**，整条阶梯的最好成绩。
+
+### split-K 是一个权衡，不是一个优化
+
+`256 x 256 x 32768` —— `grid.x*grid.y = 4` 个 block，70 个 SM 大部分在睡觉：
+
+| splitK | 1 | 2 | 4 | 8 | 16 | cuBLAS fp16 |
+| --- | --- | --- | --- | --- | --- | --- |
+| blocks | 4 | 8 | 16 | 32 | 64 | — |
+| TFLOPS | 4.23 | 8.45 | 16.3 | 31.8 | **56.7** | 68.0 |
+
+**13.4 倍，而且几乎严格线性** —— 因为瓶颈就是"块数不够"，跟 kernel 写得好不好无关。
+64 个 block 铺到 70 个 SM 上，机器才终于被喂饱，此时是 cuBLAS 的 83%。
+
+`2048³` —— `grid.x*grid.y = 256` 个 block，已经 1.83 波，不饿：
+
+| splitK | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| TFLOPS | 78.5 | 76.6 | 69.2 | 54.0 | 37.6 |
+
+**只赔不赚，而且越切越亏。** 两个原因：`atomicAdd` 把 C 变成 fp32 的 read-modify-write，
+访存流量放大 SPLITK 倍；K 每段的长度变短，流水线的序言/尾声占比上升。
+`4096³` 同理：splitK=1 → 91.6，splitK=4 → 80.6，一样只赔不赚。
+
+**判断标准就一句话**：基础 grid 的 block 数够不够填满 SM。不够才切 K。
+
+### 切 K 必须按 tile 切，不能按元素切
+
+`tbeg = (ktiles * blockIdx.z) / SPLITK` 里的乘除发生在 **tile 号**上，不是元素下标。这不是风格选择，
+是正确性要求。对照实验：只把 `tbeg` / `tend` 换成按元素切（`kbeg = K * z / SPLITK`），其余一字不动 ——
+
+| shape | splitK | 按元素切 | 按 tile 切 |
+| --- | --- | --- | --- |
+| 129 x 130 x 131 | 4 | **FAIL**，mismatched 16734 / 16770 | PASS |
+| 257 x 385 x 1000 | 4 | **FAIL**，mismatched 98406 / 98945 | PASS |
+| 128 x 128 x 2048 | 4 | PASS | PASS |
+
+为什么：loader 一次搬的是**整块 16 宽的 tile**，`kend` 只管循环跑几次，管不住"最后一块搬多宽"。
+
+- 按 tile 切：`kend = tend * BK` 必是 `BK` 的倍数，末块正好停在 `kend` 上，多读 0 个元素。
+- 按元素切：`kend` 一般不是 `BK` 的倍数，末块会**越过 `kend`**，把本该属于下一段的 k 再读一遍，
+  相邻两段同时给这段 k 记账 → 双重计数。（K=131、SPLITK=4 → `kbeg = 32`，而 32 不是 16 的倍数。）
+
+`K = 2048` 那两条为什么侥幸过了？因为 `2048 / 4 = 512 = 32 x 16` 恰好是 `BK` 的倍数，两种切法给出同一组
+边界。**这是数字的巧合，不是正确性**：测试集里混进这种"恰好对"的 shape 时，缺这个约束是查不出来的。
+
+顺带两个只有泛化之后才暴露的点：
+
+- **stage 轮转索引 `st` 必须和 tile 号解耦**。V5 里 `st` 和"第几个 tile"同余（起点是 0），怎么写都对；
+  段起点变成 `kbeg` 之后必须用独立的局部计数器 `st = (st + 1) % NSTAGE`。
+- **`cp_commit()` 必须留在 `if` 外面**（序言和主循环尾部各一处）。`cp_wait<N>` 数的是 **commit 出的**
+  **group 数**，不是 issue 出的 tile 数，空 issue 也要照常 commit；否则计数错位、`wait` 提前放行，读到
+  没搬完的 buffer。反过来这也是好事：段比流水线还短时照样安全 —— K=131、SPLITK=4 的段长只有 2~3 个
+  tile，小于 `NSTAGE=3`，实测 PASS。
 
 ## 三个必踩的坑
 
@@ -142,6 +449,15 @@ HMMA.16816.F32 R4, R4, R8, RZ
   1. 存成 **UTF-8 with BOM**；
   2. 编译时加 `-Xcompiler "/utf-8"`：`nvcc -O3 -arch=native -Xcompiler "/utf-8" V1.cu -o V1.exe`。
   表现：错误行号和真实文件对不上 → 先怀疑编码，不是代码。
+- **`compute-sanitizer` 是查越界的唯一可靠手段**。`nvcc -O3` 编出来的 kernel 越界读常常
+  "什么都不发生"：读到的垃圾只要不写回 C，结果就是对的。Step 6 的边界处理就踩了这个：
+  漏了 `grow < M` 门，三个 check 全 PASS、78.9 TFLOPS，但 sanitizer 报 6 个
+  `Invalid __global__ read`（其中 4 个是 16 字节的，来自 `cp_async16`）。
+
+  ```
+  compute-sanitizer --tool memcheck .\V6.exe 0
+  ```
+  判据只有一个：`ERROR SUMMARY: 0 errors`。
 
 ## 资料
 
