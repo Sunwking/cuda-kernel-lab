@@ -432,6 +432,58 @@ ptxas 是 0 spill）。
   没搬完的 buffer。反过来这也是好事：段比流水线还短时照样安全 —— K=131、SPLITK=4 的段长只有 2~3 个
   tile，小于 `NSTAGE=3`，实测 PASS。
 
+## ncu 剖析（2048^3 单次 launch）
+
+口径：`grid = (16,16,1)`（M=N=K=2048），取第一个计时 launch。ncu 默认把时钟锁到 base（`--clock-control base`），
+所以 duration 比 standalone 高约 14%，**只能同表内横向比**。百分比都是 `pct_of_peak_sustained_elapsed`。
+
+| 版本 | duration (µs) | 张量管线 % | DRAM % | L1TEX % | regs | occupancy % | 主 stall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| V2 tiling | 529.5 | 37.2 | 8.2 | 40.2 | 94 | 30.5 | long_scoreboard 9.9 |
+| V3 padding | 448.5 | 43.7 | 8.4 | 27.2 | 108 | 30.6 | long_scoreboard 12.3 |
+| V4 swizzle | 447.3 | 43.9 | 7.7 | 27.3 | 112 | 30.6 | long_scoreboard 11.7 |
+| V5 cp.async x3 | 252.3 | **77.9** | 13.1 | 33.6 | 104 | 30.2 | **math_pipe_throttle 15.1** |
+| V5b 寄存器双缓冲 | 252.0 | 78.0 | 15.5 | 33.9 | 128 | 29.7 | math_pipe_throttle 12.2 |
+| V6 边界 + split-K | 250.8 | **78.9** | 8.6 | 33.7 | 128 | 29.3 | math_pipe_throttle 9.0 |
+
+stall 列的单位是 `smsp__average_warps_issue_stalled_*_per_issue_active.ratio`：每次发射平均有几个 warp 卡在这个原因上。
+
+### 三件 ncu 才说得清的事
+
+1. **瓶颈搬家：从"等内存"变成"喂不动张量管线"。**
+   V2~V4 的主 stall 一直是 `long_scoreboard`（全局内存延迟）9.9 → 12.3，说明 SM 大部分时间在等 global load。
+   V5 上了 `cp.async` 三级流水之后同一列掉到 **0.38**（内存延迟被预取藏干净），主 stall 换成
+   `math_pipe_throttle` **15.1** —— 卡在"张量管线忙不过来"。张量管线利用率 37% → 78%，
+   这一步 1.7 倍加速全部来自这个结构性变化。
+
+2. **bank conflict 是看得见的。** V2 → V4 的 L1TEX 吞吐 40.2% → 27.2%，同时 `mio_throttle` 2.11 → 0.37、
+   `short_scoreboard` 2.05 → 0.18，而张量管线 37.2% → 44%。这几个数一起动才是"shared memory 冲突被消掉"的证据；
+   光看耗时 529 → 448 µs 只能说"快了"，说不出为什么快。
+
+3. **occupancy 从来不是这里的瓶颈。** 六版都在 29~31%（2 block/SM x 8 warp / 48 warp = 33% 的理论上限），
+   `launch__occupancy_limit_registers = 2`、`launch__occupancy_limit_shared_mem = 2~3` —— 两个限制同时卡在 2。
+   所以 V5b 把寄存器从 104 加到 128 也没掉 occupancy；而 `MINB=1` 那一版是 151 regs / limit=1，
+   就是 Step 5b 里掉到 70.9 TFLOPS 的那条路。**这六版从头到尾都是 2 block/SM，性能差异全部来自 stall 结构，不是并行度。**
+
+> 另外：`sm__throughput` 与 `sm__pipe_tensor_cycles_active` 在每一版都**完全相等** ——
+> SM 侧占用率最高的单元就是张量管线本身，ALU / LSU / SFU 全都很闲。
+
+### 复现
+
+```powershell
+cd Operator\GEMM-TC
+ncu --csv --kernel-name regex:gemm_tc --launch-skip 12 --launch-count 1 `
+  --metrics gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,`
+sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,launch__registers_per_thread,`
+sm__warps_active.avg.pct_of_peak_sustained_active,`
+smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio,`
+smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio .\V6.exe
+# --launch-skip：V2~V5b 用 12（2 个 check + 10 次 warm-up），V6 用 14（4 个 check + 10 次 warm-up）。
+# 用输出里的 grid dims 核对确实落在 (16, 16, 1) = 2048^3。
+```
+
+ncu 权限（`ERR_NVGPUCTRPERM`）的一次性解决办法见 `Operator/LayerNorm/README.md` §6。
+
 ## 三个必踩的坑
 
 - **`row.col` 不是内存布局**。B 在内存里仍是 row-major 的 `K x N`，只是按 col-major 的
@@ -458,6 +510,10 @@ ptxas 是 0 spill）。
   compute-sanitizer --tool memcheck .\V6.exe 0
   ```
   判据只有一个：`ERROR SUMMARY: 0 errors`。
+- **改过 `-D` 开关或源码之后一定要重编再测**。磁盘上的旧 `.exe` 会让 ncu 数据说谎：
+  这次做 ncu 剖析时就发现 `V5b.exe` 还是改 `MINB` 之前编的（151 regs / 1 block/SM），
+  重编成 128 regs / 2 block/SM 之后才和 README 里的 bench 数字对得上。
+  自查办法：`nvcc -Xptxas -v` 报的寄存器数应该和 ncu 的 `launch__registers_per_thread` 一致。
 
 ## 资料
 

@@ -29,6 +29,7 @@ Operator/
   OSoftmax/           V0 .. V4（online softmax）
   LayerNorm/          V0 .. V3
   RMSNorm/            V0 .. V1
+  Fusion/             V0 .. V3（Residual+RMSNorm / +float4 / RMSNorm+RoPE / SwiGLU）
 ```
 
 ## 算子一览
@@ -45,6 +46,7 @@ Operator/
 | OnlineSoftmax | 5（V0–V4） | V1 | 161.4 µs @4096²，6.9x vs V0；已到访存 roofline 的 92.6% | ncu 剖析完成 |
 | LayerNorm | 4（V0–V3） | V0 | 717.6 GB/s = 纯拷贝上限的 94%；V1–V3 反而更慢（优化错了方向） | ncu 待补（权限） |
 | RMSNorm | 2（V0–V1） | V0 | 723.6 GB/s = 纯拷贝上限的 94.8% | ncu 待补（权限） |
+| Kernel Fusion | 4（V0–V3） | V2 | 字节账上限 1.25x / 2.00x / 1.67x → 实测 1.213x / 1.983x / 1.683x，全部顶到 DRAM roofline | 剖析完成 |
 
 ## 复现
 
@@ -60,6 +62,10 @@ nvcc -O3 -arch=native Operator\GEMM\V51.cu -o Operator\GEMM\V51.exe
 # Tensor Core GEMM：V6 = 任意 shape 边界 + split-K（-DSPLITKV=n 切 K 方向段数）
 nvcc -O3 -arch=native -Xcompiler "/utf-8" Operator\GEMM-TC\V6.cu -o Operator\GEMM-TC\V6.exe
 .\Operator\GEMM-TC\V6.exe 0
+
+# Kernel Fusion（V0 标量 → V3 SwiGLU；SwiGLU 的消融就是改 act() 里那一行）
+nvcc -O3 -arch=native -Xcompiler "/utf-8" Operator\Fusion\V3.cu -o Operator\Fusion\V3.exe
+.\Operator\Fusion\V3.exe
 ```
 
 ## 参考
